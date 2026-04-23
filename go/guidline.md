@@ -17,9 +17,10 @@
 9. [Performance Engineering](#9-performance-engineering)
 10. [Observability](#10-observability)
 11. [Production Readiness](#11-production-readiness)
-12. [Security](#12-security)
-13. [Dependencies & Tooling](#13-dependencies--tooling)
-14. [Agent Workflow Checklist](#14-agent-workflow-checklist)
+12. [Local Development Environment](#12-local-development-environment)
+13. [Security](#13-security)
+14. [Dependencies & Tooling](#14-dependencies--tooling)
+15. [Agent Workflow Checklist](#15-agent-workflow-checklist)
 
 ---
 
@@ -64,7 +65,9 @@ myservice/
 ├── pkg/                     # Public, importable packages (use sparingly)
 ├── api/                     # OpenAPI, protobuf, schema definitions
 ├── migrations/              # Database migrations
-├── test/                    # Integration/E2E tests requiring fixtures
+├── test/                    # Integration/E2E helpers requiring fixtures
+├── docker-compose.yml       # Interactive local dev stack (see §12)
+├── .env.example             # Committed; documents required env vars
 ├── go.mod
 ├── go.sum
 ├── Makefile
@@ -533,11 +536,100 @@ func BenchmarkParse(b *testing.B) {
 - `go test -cover ./...`
 - Coverage is a floor, not a ceiling. 90% coverage of the wrong things is useless.
 
-### Integration tests
+### Functional & integration tests
 
-- Use build tags (`//go:build integration`) to separate from unit tests.
-- Use [testcontainers-go](https://github.com/testcontainers/testcontainers-go) for real dependencies (Postgres, Redis) rather than mocks.
-- Seed data in `t.Cleanup` teardown, not shared fixtures.
+**Automated functional and integration tests use [`testcontainers-go`](https://github.com/testcontainers/testcontainers-go). They do not use docker-compose.** Keep this boundary strict:
+
+| Use case | Tool |
+|---|---|
+| Interactive local development (running the binary, manual QA, exploratory work) | `docker-compose` — see §12 |
+| Automated test suite (unit with real deps, functional, integration, E2E) | `testcontainers-go` |
+
+Rationale for the split:
+
+- Tests start their own containers. No dependency on a developer's compose stack being up or in a known state.
+- Each test gets a fresh container with a random host port — no port collisions, safe for `t.Parallel()`.
+- CI and local runs execute the same code path; no "works on my machine" drift because someone's local compose had different data.
+- Cleanup is automatic via `t.Cleanup` or `testcontainers.CleanupContainer`.
+- Reproducibility: the container configuration is in Go code under version control, next to the tests that depend on it.
+
+**Rules:**
+
+- Separate integration tests with a build tag: `//go:build integration` at the top of the file.
+- Prefer per-package container reuse via `TestMain` when tests within the package share the same dependency and don't mutate cross-test state. Use per-test containers when isolation matters more than startup cost.
+- Use the official [testcontainers-go modules](https://golang.testcontainers.org/modules/) for common services: `postgres`, `redis`, `kafka`, `localstack`, etc. Don't reinvent them.
+- Pin image tags to specific versions. They must match the versions used in `docker-compose.yml` and production.
+- Seed data inside the test, not via a shared fixture file. Every test owns its setup.
+- Wait for readiness with the module's wait strategies, never `time.Sleep`.
+- Run unit tests (no tag) on every save locally; run integration tests on push and in CI.
+
+**Example:**
+
+```go
+//go:build integration
+
+package userrepo_test
+
+import (
+    "context"
+    "database/sql"
+    "testing"
+
+    _ "github.com/jackc/pgx/v5/stdlib"
+    "github.com/testcontainers/testcontainers-go"
+    "github.com/testcontainers/testcontainers-go/modules/postgres"
+)
+
+func setupPostgres(t *testing.T) *sql.DB {
+    t.Helper()
+    ctx := context.Background()
+
+    pg, err := postgres.Run(ctx, "postgres:16.3-alpine",
+        postgres.WithDatabase("test"),
+        postgres.WithUsername("test"),
+        postgres.WithPassword("test"),
+        postgres.BasicWaitStrategies(),
+    )
+    if err != nil {
+        t.Fatalf("start postgres: %v", err)
+    }
+    testcontainers.CleanupContainer(t, pg)
+
+    dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
+    if err != nil {
+        t.Fatalf("conn string: %v", err)
+    }
+    db, err := sql.Open("pgx", dsn)
+    if err != nil {
+        t.Fatalf("open: %v", err)
+    }
+    t.Cleanup(func() { db.Close() })
+
+    if err := runMigrations(db); err != nil {
+        t.Fatalf("migrate: %v", err)
+    }
+    return db
+}
+
+func TestUserRepo_Insert(t *testing.T) {
+    t.Parallel()
+    db := setupPostgres(t)
+    repo := NewUserRepo(db)
+
+    u := &User{Email: "a@example.com"}
+    if err := repo.Insert(context.Background(), u); err != nil {
+        t.Fatalf("insert: %v", err)
+    }
+    // ...assertions
+}
+```
+
+**Anti-patterns:**
+
+- ❌ Tests that assume `docker compose up` was run first. Tests must be self-starting.
+- ❌ Shared database across tests with `TRUNCATE` between them. Leads to flaky parallel tests.
+- ❌ `time.Sleep(5 * time.Second) // wait for db`. Use wait strategies.
+- ❌ Pinning to `:latest` image tags. Tests that passed yesterday fail today with no code change.
 
 ---
 
@@ -707,7 +799,120 @@ Use `golang.org/x/time/rate` for in-process limits; Redis-based token buckets fo
 
 ---
 
-## 12. Security
+## 12. Local Development Environment
+
+Use **`docker-compose`** for everything an engineer runs *interactively* while developing: databases, caches, message brokers, fake external services, and optional observability stacks. The goal is that a fresh clone is one command away from a working dev environment.
+
+### Scope
+
+| Scenario | Tool |
+|---|---|
+| Running the binary locally against real dependencies | `docker-compose` |
+| Manual QA, exploratory debugging, seeded demo data | `docker-compose` |
+| Automated test suite (any `go test` invocation) | `testcontainers-go` — see §8 |
+
+**Never use docker-compose from tests.** Tests that require `docker compose up` beforehand are fragile, non-parallelizable, and drift from CI. That's what testcontainers-go is for.
+
+### Rules
+
+- `docker-compose.yml` lives at the repository root.
+- **Pin image tags to specific versions** (`postgres:16.3-alpine`, not `postgres:latest` or `postgres:16`). The pinned tag must match what testcontainers-go uses and what production runs.
+- Expose service ports on `localhost` so the Go binary running on the host can connect. Standard layout: each service binds to its canonical port unless it conflicts with something on developer machines.
+- Use **named volumes** for data that should persist across `docker compose down`. Use `tmpfs` for ephemeral data you want wiped on restart.
+- Provide `.env.example` (committed) documenting every variable the stack reads; `.env` is gitignored. Compose loads `.env` automatically.
+- Define a `healthcheck` on every service. Use `depends_on: { condition: service_healthy }` so services start in the right order.
+- Keep compose focused on **dependencies**, not the Go binary itself. Developers iterate fastest running `go run ./cmd/myservice` on the host against containerized deps. Add a service for the app only when you need to test the containerized build.
+- Use `profiles` for optional stacks (e.g. `profiles: [observability]` for Prometheus/Grafana/Jaeger). Default `docker compose up` should be minimal and fast.
+- Document first-time setup in `README.md`: `cp .env.example .env && make dev-up`.
+
+### Example `docker-compose.yml`
+
+```yaml
+services:
+  postgres:
+    image: postgres:16.3-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-app}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-app}
+      POSTGRES_DB: ${DB_NAME:-app}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  # Optional: observability stack, opt-in via `docker compose --profile observability up`
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    profiles: [observability]
+    ports:
+      - "16686:16686"  # UI
+      - "4317:4317"    # OTLP gRPC
+
+volumes:
+  pgdata:
+```
+
+### Makefile targets
+
+```makefile
+.PHONY: dev-up dev-down dev-logs dev-reset dev-psql
+
+dev-up:               ## Start local dev dependencies
+	docker compose up -d --wait
+
+dev-down:             ## Stop local dev dependencies (keeps data)
+	docker compose down
+
+dev-logs:             ## Tail dependency logs
+	docker compose logs -f
+
+dev-reset:            ## Nuke volumes and start fresh
+	docker compose down -v && docker compose up -d --wait
+
+dev-psql:             ## Open a psql shell to the dev database
+	docker compose exec postgres psql -U $${DB_USER:-app} -d $${DB_NAME:-app}
+```
+
+### Version alignment
+
+The same image tags must appear in three places. Keep them in sync:
+
+1. `docker-compose.yml` — what developers run.
+2. `testcontainers-go` `Run(...)` calls — what the automated test suite runs.
+3. Production deployment manifests — what actually serves traffic.
+
+A shared constants file keeps drift from creeping in:
+
+```go
+// internal/testsupport/images.go
+package testsupport
+
+// Image tags used by both docker-compose.yml and testcontainers-go.
+// Keep in sync with production deployment manifests.
+const (
+    PostgresImage = "postgres:16.3-alpine"
+    RedisImage    = "redis:7.2-alpine"
+)
+```
+
+---
+
+## 13. Security
 
 - **Parameterized queries only.** Never `fmt.Sprintf` SQL. Use `database/sql` placeholders or a query builder like `sqlc`.
 - **Validate all external input.** Length, range, encoding, format.
@@ -721,7 +926,7 @@ Use `golang.org/x/time/rate` for in-process limits; Redis-based token buckets fo
 
 ---
 
-## 13. Dependencies & Tooling
+## 14. Dependencies & Tooling
 
 ### Go modules
 
@@ -734,12 +939,13 @@ Use `golang.org/x/time/rate` for in-process limits; Redis-based token buckets fo
 ### Required CI checks
 
 ```bash
-go fmt ./...                  # formatting
-go vet ./...                  # static checks
-golangci-lint run ./...       # lint suite
-go test -race -cover ./...    # unit tests with race detector
-govulncheck ./...             # known vulnerabilities
-go build ./...                # compile succeeds
+go fmt ./...                                # formatting
+go vet ./...                                # static checks
+golangci-lint run ./...                     # lint suite
+go test -race -cover ./...                  # unit tests with race detector
+go test -tags=integration -race ./...       # integration tests via testcontainers-go
+govulncheck ./...                           # known vulnerabilities
+go build ./...                              # compile succeeds
 ```
 
 ### Recommended golangci-lint config
@@ -749,7 +955,7 @@ Enable at minimum: `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, 
 ### Makefile skeleton
 
 ```makefile
-.PHONY: all fmt lint test build
+.PHONY: all fmt lint test test-integration build dev-up dev-down
 
 all: fmt lint test build
 
@@ -763,8 +969,17 @@ lint:
 test:
 	go test -race -cover ./...
 
+test-integration:
+	go test -tags=integration -race ./...
+
 build:
 	go build -trimpath -ldflags="-s -w" -o bin/ ./cmd/...
+
+dev-up:
+	docker compose up -d --wait
+
+dev-down:
+	docker compose down
 ```
 
 ### Build flags
@@ -775,7 +990,7 @@ build:
 
 ---
 
-## 14. Agent Workflow Checklist
+## 15. Agent Workflow Checklist
 
 When writing or modifying Go code, an agent should proceed as follows:
 
@@ -784,10 +999,12 @@ When writing or modifying Go code, an agent should proceed as follows:
 - [ ] Read existing code in the target package. Match its style and patterns.
 - [ ] Check `go.mod` for the Go version and available dependencies. Don't add new deps without reason.
 - [ ] Identify the interface boundaries. What's the smallest unit that can be tested?
+- [ ] If the change requires running the binary, ensure `docker compose up -d --wait` is green.
 
 ### Red phase
 
 - [ ] Write a failing test that describes the new behavior.
+- [ ] For tests that need real infrastructure, use testcontainers-go — never rely on the developer's docker-compose stack.
 - [ ] Run the test. Confirm it fails for the right reason (not a compile error).
 
 ### Green phase
@@ -808,6 +1025,7 @@ When writing or modifying Go code, an agent should proceed as follows:
 - [ ] `go vet ./...`
 - [ ] `golangci-lint run ./...`
 - [ ] `go test -race -cover ./...`
+- [ ] `go test -tags=integration -race ./...` (if integration tests exist)
 - [ ] `govulncheck ./...`
 - [ ] All errors are handled or explicitly ignored with justification.
 - [ ] All goroutines have bounded lifetimes.
@@ -816,6 +1034,7 @@ When writing or modifying Go code, an agent should proceed as follows:
 - [ ] No secrets, PII, or large payloads are logged.
 - [ ] Exported identifiers have doc comments.
 - [ ] New public APIs have examples (`ExampleFoo` functions) where useful.
+- [ ] If a new dependency service was added, it's in `docker-compose.yml` AND consumed by tests via testcontainers-go (image tags aligned).
 - [ ] CHANGELOG / commit message describes *why*, not just *what*.
 
 ### When stuck
@@ -858,6 +1077,8 @@ When writing or modifying Go code, an agent should proceed as follows:
 - [Google Go Style Guide](https://google.github.io/styleguide/go/)
 - [Go Proverbs](https://go-proverbs.github.io/)
 - [The Go Memory Model](https://go.dev/ref/mem)
+- [testcontainers-go documentation](https://golang.testcontainers.org/)
+- [Docker Compose specification](https://docs.docker.com/compose/compose-file/)
 - [Go Blog](https://go.dev/blog/)
 
 ---
