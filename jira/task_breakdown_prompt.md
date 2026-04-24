@@ -46,5 +46,8 @@ CONSTRAINTS AND QUALITY BAR
 FORMAT
 Use clear headings and Jira-style fields. Present the plan in this order: Executive Summary (5-8 bullets) → Milestone Overview table → Detailed Milestones/Epics/Stories → Cross-Milestone Dependency Map → Clarifications Needed.
 
+OUTPUT FILE
+Write the Jira delivery plan to jira_plan.md file.
+
 ARCHITECTURE DESIGN DOCUMENT:
 [paste document here or reference the attachment]
